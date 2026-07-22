@@ -38,6 +38,10 @@ function createWindow() {
 
     mainWindow.loadURL(`file://${path.join(__dirname, "index.html")}`);
 
+    mainWindow.webContents.on("console-message", (event, level, message, line, sourceId) => {
+        console.log(`[renderer] ${message} (${sourceId}:${line})`);
+    });
+
     mainWindow.on("closed", () => {
         mainWindow = null;
     });

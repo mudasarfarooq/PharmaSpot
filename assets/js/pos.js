@@ -223,6 +223,12 @@ if (auth == undefined) {
 
     $(".loading").hide();
 
+    $(document).on("hide.bs.modal", ".modal", function () {
+      if (document.activeElement) {
+        document.activeElement.blur();
+      }
+    });
+
     loadCategories();
     loadProducts();
     loadCustomers();
@@ -805,12 +811,13 @@ if (auth == undefined) {
       }
 
       logo = path.join(img_path, validator.unescape(settings.img));
+      let logoSrc = getLogoSrc(logo);
 
       receipt = `<div style="font-size: 10px">                            
         <p style="text-align: center;">
         ${
-          checkFileExists(logo)
-            ? `<img style='max-width: 50px' src='${logo}' /><br>`
+          logoSrc
+            ? `<img style='max-width: 80px;' src='${logoSrc}' /><br>`
             : ``
         }
             <span style="font-size: 22px;">${validator.unescape(settings.store)}</span> <br>
@@ -886,7 +893,7 @@ if (auth == undefined) {
 
       if (status == 3) {
         if (cart.length > 0) {
-          printJS({ printable: receipt, type: "raw-html" });
+          printReceipt(receipt);
 
           $(".loading").hide();
           return;
@@ -2044,9 +2051,10 @@ if (auth == undefined) {
           $("#quick_billing").prop("checked", false);
         }
         if (validator.unescape(settings.img) != "") {
+          let settingsLogoSrc = getLogoSrc(validator.unescape(settings.img));
           $("#logoname").hide();
           $("#current_logo").html(
-            `<img src="${img_path + validator.unescape(settings.img)}" alt="">`,
+            `<img src="${settingsLogoSrc || (img_path + validator.unescape(settings.img))}" alt="">`,
           );
           $("#rmv_logo").show();
         }
@@ -2058,7 +2066,7 @@ if (auth == undefined) {
           .prop("selected", true);
       }
     });
- });
+  });
 
   $("#rmv_logo").on("click", function () {
     $("#remove_logo").val("1");
@@ -2077,8 +2085,153 @@ if (auth == undefined) {
   });
 }
 
+function getLogoSrc(logoPath) {
+  try {
+    if (!logoPath) return "";
+    let fullPath = logoPath;
+    if (!checkFileExists(fullPath)) {
+      fullPath = path.join(img_path, logoPath);
+    }
+    if (checkFileExists(fullPath)) {
+      const ext = path.extname(fullPath).toLowerCase().replace(".", "") || "png";
+      const mimeType = ext === "svg" ? "image/svg+xml" : `image/${ext === "jpg" ? "jpeg" : ext}`;
+      const fileData = fs.readFileSync(fullPath);
+      return `data:${mimeType};base64,${fileData.toString("base64")}`;
+    }
+  } catch (e) {
+    console.error("Error generating logo src:", e);
+  }
+  return "";
+}
+
+const RECEIPT_PAPER_WIDTH_MM = 80;
+const RECEIPT_PAPER_WIDTH_MICRONS = RECEIPT_PAPER_WIDTH_MM * 1000;
+const RECEIPT_WINDOW_WIDTH_PX = Math.round((RECEIPT_PAPER_WIDTH_MM / 25.4) * 96);
+const THERMAL_PRINTER_NAME_PATTERN = /(sp[\s-]?200|thermal|receipt|pos[\s-]?58|pos[\s-]?80|epson|tm-|star|bixolon)/i;
+
+async function detectReceiptPrinter(webContents) {
+  try {
+    const printers = await webContents.getPrintersAsync();
+    if (!printers || printers.length === 0) return null;
+
+    const saved = storage.get("receipt_printer");
+    if (saved && printers.some((p) => p.name === saved)) {
+      return saved;
+    }
+
+    const thermalMatch = printers.find((p) => THERMAL_PRINTER_NAME_PATTERN.test(p.name));
+    if (thermalMatch) return thermalMatch.name;
+
+    const defaultPrinter = printers.find((p) => p.isDefault);
+    if (defaultPrinter) return defaultPrinter.name;
+
+    return printers[0].name;
+  } catch (e) {
+    console.error("Error detecting printer:", e);
+    return null;
+  }
+}
+
+async function printReceipt(receiptContent) {
+  console.log("[print] printReceipt() called");
+
+  const printWin = new remote.BrowserWindow({
+    width: RECEIPT_WINDOW_WIDTH_PX + 20,
+    height: 600,
+    show: false,
+    webPreferences: { contextIsolation: false },
+  });
+
+  try {
+    const html = `<!DOCTYPE html>
+      <html>
+        <head>
+          <style>
+            * { box-sizing: border-box; }
+            html, body { margin: 0; padding: 6px; width: ${RECEIPT_WINDOW_WIDTH_PX}px; font-family: monospace; }
+            img { max-width: 100%; height: auto; }
+          </style>
+        </head>
+        <body>${receiptContent}</body>
+      </html>`;
+
+    await printWin.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+
+    await printWin.webContents.executeJavaScript(`
+      new Promise((resolve) => {
+        const imgs = Array.from(document.images);
+        let pending = imgs.filter((img) => !img.complete).length;
+        if (pending === 0) return resolve();
+        imgs.forEach((img) => {
+          img.onload = img.onerror = () => {
+            pending--;
+            if (pending <= 0) resolve();
+          };
+        });
+        setTimeout(resolve, 2000);
+      })
+    `);
+
+    const contentHeightPx = await printWin.webContents.executeJavaScript(
+      "document.body.scrollHeight",
+    );
+    const heightMicrons = Math.max(
+      Math.round((contentHeightPx / 96) * 25400) + 10000,
+      40000,
+    );
+
+    const printerName = await detectReceiptPrinter(printWin.webContents);
+    if (printerName) {
+      storage.set("receipt_printer", printerName);
+    }
+    console.log(
+      "[print] detected printer:",
+      printerName || "(none - will show print dialog)",
+    );
+
+    printWin.show();
+
+    printWin.webContents.print(
+      {
+        silent: false,
+        printBackground: true,
+        deviceName: printerName || undefined,
+        margins: { marginType: "none" },
+        pageSize: {
+          width: RECEIPT_PAPER_WIDTH_MICRONS,
+          height: heightMicrons,
+        },
+      },
+      (success, errorType) => {
+        console.log("[print] print callback:", success, errorType || "");
+        if (!success) {
+          console.error("Print failed:", errorType);
+          notiflix.Report.failure(
+            "Print failed",
+            errorType || "Unknown printing error",
+            "Ok",
+          );
+        }
+        if (!printWin.isDestroyed()) {
+          printWin.close();
+        }
+      },
+    );
+  } catch (e) {
+    console.error("Print error:", e);
+    notiflix.Report.failure(
+      "Print error",
+      e && e.message ? e.message : "Something went wrong while printing",
+      "Ok",
+    );
+    if (!printWin.isDestroyed()) {
+      printWin.close();
+    }
+  }
+}
+
 $.fn.print = function () {
-  printJS({ printable: receipt, type: "raw-html" });
+  printReceipt(receipt);
 };
 
 function loadTransactions() {
@@ -2355,12 +2508,13 @@ $.fn.viewTransaction = function (index) {
   }
 
     logo = path.join(img_path, validator.unescape(settings.img));
+    let logoSrc = getLogoSrc(logo);
       
       receipt = `<div style="font-size: 10px">                            
         <p style="text-align: center;">
         ${
-          checkFileExists(logo)
-            ? `<img style='max-width: 50px' src='${logo}' /><br>`
+          logoSrc
+            ? `<img style='max-width: 80px;' src='${logoSrc}' /><br>`
             : ``
         }
             <span style="font-size: 22px;">${validator.unescape(settings.store)}</span> <br>
