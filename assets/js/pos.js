@@ -8,6 +8,8 @@ const DOMPurify = require("dompurify");
 const _ = require("lodash");
 let fs = require("fs");
 let path = require("path");
+let os = require("os");
+let { execFile } = require("child_process");
 let moment = require("moment");
 let { ipcRenderer } = require("electron");
 let dotInterval = setInterval(function () {
@@ -33,6 +35,7 @@ let perms = null;
 let deleteId = 0;
 let paymentType = 0;
 let receipt = "";
+let receiptData = null;
 let totalVat = 0;
 let subTotal = 0;
 let method = "";
@@ -891,9 +894,38 @@ if (auth == undefined) {
              </p>
             </div>`;
 
+      receiptData = {
+        store: validator.unescape(settings.store),
+        addressOne: validator.unescape(settings.address_one),
+        addressTwo: validator.unescape(settings.address_two),
+        contact: validator.unescape(settings.contact),
+        taxNo: validator.unescape(settings.tax),
+        orderNumber,
+        refNumber: refNumber == "" ? orderNumber : refNumber,
+        customerName: customer == 0 ? "Walk in customer" : customer.name,
+        cashier: user.fullname,
+        date,
+        items: cart.map((item) => ({
+          name: item.product_name,
+          qty: item.quantity,
+          price: Math.abs(item.price),
+        })),
+        symbol: validator.unescape(settings.symbol),
+        subTotal,
+        discount: parseFloat(discount) || 0,
+        chargeTax: !!settings.charge_tax,
+        taxPercentage: validator.unescape(settings.percentage),
+        totalVat,
+        orderTotal: parseFloat(orderTotal),
+        paid,
+        change,
+        paymentType: type,
+        footer: validator.unescape(settings.footer),
+      };
+
       if (status == 3) {
         if (cart.length > 0) {
-          printReceipt(receipt);
+          printReceipt(receiptData);
 
           $(".loading").hide();
           return;
@@ -2006,6 +2038,8 @@ if (auth == undefined) {
     });
 
     $("#settings").on("click", function () {
+      populatePrinterSelect();
+
       if (platform.app == "Network Point of Sale Terminal") {
         $("#net_settings_form").show(500);
         $("#settings_form").hide(500);
@@ -2068,6 +2102,17 @@ if (auth == undefined) {
     });
   });
 
+  $("#receipt_printer").on("change", function () {
+    const value = $(this).val();
+    if (value) {
+      storage.set("receipt_printer", value);
+      notiflix.Notify.success(`Receipt printer set to ${value}`);
+    } else {
+      storage.delete("receipt_printer");
+      notiflix.Notify.info("Receipt printer will be auto-detected");
+    }
+  });
+
   $("#rmv_logo").on("click", function () {
     $("#remove_logo").val("1");
     // $("#logo_img").val('');
@@ -2104,10 +2149,30 @@ function getLogoSrc(logoPath) {
   return "";
 }
 
-const RECEIPT_PAPER_WIDTH_MM = 80;
-const RECEIPT_PAPER_WIDTH_MICRONS = RECEIPT_PAPER_WIDTH_MM * 1000;
-const RECEIPT_WINDOW_WIDTH_PX = Math.round((RECEIPT_PAPER_WIDTH_MM / 25.4) * 96);
 const THERMAL_PRINTER_NAME_PATTERN = /(sp[\s-]?200|thermal|receipt|pos[\s-]?58|pos[\s-]?80|epson|tm-|star|bixolon)/i;
+const RECEIPT_COLUMNS = 42;
+const ESC = 0x1b;
+const GS = 0x1d;
+
+async function populatePrinterSelect() {
+  const $select = $("#receipt_printer");
+  if ($select.length === 0) return;
+
+  try {
+    const printers = await remote.getCurrentWebContents().getPrintersAsync();
+    const saved = storage.get("receipt_printer");
+
+    $select.empty();
+    $select.append('<option value="">Auto-detect</option>');
+    (printers || []).forEach((p) => {
+      $select.append(`<option value="${p.name}">${p.name}${p.isDefault ? " (system default)" : ""}</option>`);
+    });
+
+    $select.val(saved && printers.some((p) => p.name === saved) ? saved : "");
+  } catch (e) {
+    console.error("Error listing printers:", e);
+  }
+}
 
 async function detectReceiptPrinter(webContents) {
   try {
@@ -2132,106 +2197,137 @@ async function detectReceiptPrinter(webContents) {
   }
 }
 
-async function printReceipt(receiptContent) {
-  console.log("[print] printReceipt() called");
+function padLine(left, right) {
+  left = String(left);
+  right = String(right);
+  const gap = RECEIPT_COLUMNS - left.length - right.length;
+  if (gap < 1) {
+    return left.slice(0, Math.max(RECEIPT_COLUMNS - right.length - 1, 0)) + " " + right;
+  }
+  return left + " ".repeat(gap) + right;
+}
 
-  const printWin = new remote.BrowserWindow({
-    width: RECEIPT_WINDOW_WIDTH_PX + 20,
-    height: 600,
-    show: false,
-    webPreferences: { contextIsolation: false },
+function centerText(text) {
+  text = String(text);
+  if (text.length >= RECEIPT_COLUMNS) return text;
+  return " ".repeat(Math.floor((RECEIPT_COLUMNS - text.length) / 2)) + text;
+}
+
+function divider() {
+  return "-".repeat(RECEIPT_COLUMNS);
+}
+
+function buildEscPosReceipt(data) {
+  const money = (n) => `${data.symbol}${moneyFormat(Number(n || 0).toFixed(2))}`;
+  const lines = [];
+
+  lines.push(centerText(data.store));
+  if (data.addressOne) lines.push(centerText(data.addressOne));
+  if (data.addressTwo) lines.push(centerText(data.addressTwo));
+  if (data.contact) lines.push(centerText(`Tel: ${data.contact}`));
+  if (data.taxNo) lines.push(centerText(`Vat No: ${data.taxNo}`));
+  lines.push(divider());
+  lines.push(`Order No : ${data.orderNumber}`);
+  lines.push(`Ref No   : ${data.refNumber}`);
+  lines.push(`Customer : ${data.customerName}`);
+  lines.push(`Cashier  : ${data.cashier}`);
+  lines.push(`Date     : ${data.date}`);
+  lines.push(divider());
+
+  (data.items || []).forEach((item) => {
+    lines.push(item.name);
+    lines.push(padLine(`  ${item.qty} x ${money(item.price)}`, money(item.qty * item.price)));
   });
 
+  lines.push(divider());
+  lines.push(padLine("Subtotal", money(data.subTotal)));
+  if (data.discount > 0) {
+    lines.push(padLine("Discount", money(data.discount)));
+  }
+  if (data.chargeTax) {
+    lines.push(padLine(`VAT (${data.taxPercentage}%)`, money(data.totalVat)));
+  }
+  lines.push(padLine("TOTAL", money(data.orderTotal)));
+  if (data.paid !== "" && data.paid != null) {
+    lines.push(padLine("Paid", money(data.paid)));
+    lines.push(padLine("Change", money(Math.abs(data.change))));
+    lines.push(padLine("Method", data.paymentType));
+  }
+  lines.push(divider());
+  if (data.footer) {
+    String(data.footer)
+      .split("\n")
+      .forEach((line) => lines.push(centerText(line)));
+  }
+
+  const body = lines.join("\n") + "\n";
+
+  return Buffer.concat([
+    Buffer.from([ESC, 0x40]),
+    Buffer.from(body, "latin1"),
+    Buffer.from([ESC, 0x64, 4]),
+    Buffer.from([GS, 0x56, 0x42, 0x00]),
+  ]);
+}
+
+async function printReceipt(data) {
+  console.log("[print] printReceipt() called");
+
+  if (!data) {
+    console.error("[print] no receipt data to print");
+    return;
+  }
+
   try {
-    const html = `<!DOCTYPE html>
-      <html>
-        <head>
-          <style>
-            * { box-sizing: border-box; }
-            html, body { margin: 0; padding: 6px; width: ${RECEIPT_WINDOW_WIDTH_PX}px; font-family: monospace; }
-            img { max-width: 100%; height: auto; }
-          </style>
-        </head>
-        <body>${receiptContent}</body>
-      </html>`;
+    const printerName = await detectReceiptPrinter(remote.getCurrentWebContents());
+    console.log("[print] detected printer:", printerName || "(none found)");
 
-    await printWin.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
-
-    await printWin.webContents.executeJavaScript(`
-      new Promise((resolve) => {
-        const imgs = Array.from(document.images);
-        let pending = imgs.filter((img) => !img.complete).length;
-        if (pending === 0) return resolve();
-        imgs.forEach((img) => {
-          img.onload = img.onerror = () => {
-            pending--;
-            if (pending <= 0) resolve();
-          };
-        });
-        setTimeout(resolve, 2000);
-      })
-    `);
-
-    const contentHeightPx = await printWin.webContents.executeJavaScript(
-      "document.body.scrollHeight",
-    );
-    const heightMicrons = Math.max(
-      Math.round((contentHeightPx / 96) * 25400) + 10000,
-      40000,
-    );
-
-    const printerName = await detectReceiptPrinter(printWin.webContents);
-    if (printerName) {
-      storage.set("receipt_printer", printerName);
+    if (!printerName) {
+      notiflix.Report.failure(
+        "No printer found",
+        "Could not find a receipt printer. Please check it is connected and installed on this machine.",
+        "Ok",
+      );
+      return;
     }
-    console.log(
-      "[print] detected printer:",
-      printerName || "(none - will show print dialog)",
-    );
 
-    printWin.show();
+    storage.set("receipt_printer", printerName);
 
-    printWin.webContents.print(
-      {
-        silent: false,
-        printBackground: true,
-        deviceName: printerName || undefined,
-        margins: { marginType: "none" },
-        pageSize: {
-          width: RECEIPT_PAPER_WIDTH_MICRONS,
-          height: heightMicrons,
-        },
-      },
-      (success, errorType) => {
-        console.log("[print] print callback:", success, errorType || "");
-        if (!success) {
-          console.error("Print failed:", errorType);
-          notiflix.Report.failure(
-            "Print failed",
-            errorType || "Unknown printing error",
+    const buffer = buildEscPosReceipt(data);
+    const tmpFile = path.join(os.tmpdir(), `pharmaspot-receipt-${Date.now()}.prn`);
+    fs.writeFileSync(tmpFile, buffer);
+
+    execFile("lp", ["-d", printerName, "-o", "raw", tmpFile], (error, stdout, stderr) => {
+      fs.unlink(tmpFile, () => {});
+      if (error) {
+        console.error("[print] lp failed:", error, stderr);
+        notiflix.Report.failure("Print failed", stderr || error.message, "Ok");
+        return;
+      }
+      console.log("[print] print job sent:", stdout);
+
+      execFile("lpstat", ["-p", printerName], (statError, statStdout) => {
+        if (!statError && /offline/i.test(statStdout)) {
+          notiflix.Report.warning(
+            "Printer offline",
+            `"${printerName}" is not responding. The receipt was queued but will not print until it's reconnected. Check the cable/power, then clear the stuck queue if needed.`,
             "Ok",
           );
         }
-        if (!printWin.isDestroyed()) {
-          printWin.close();
-        }
-      },
-    );
+      });
+    });
   } catch (e) {
-    console.error("Print error:", e);
+    console.error("[print] print error:", e);
     notiflix.Report.failure(
       "Print error",
       e && e.message ? e.message : "Something went wrong while printing",
       "Ok",
     );
-    if (!printWin.isDestroyed()) {
-      printWin.close();
-    }
   }
 }
 
 $.fn.print = function () {
-  printReceipt(receipt);
+  printReceipt(receiptData);
 };
 
 function loadTransactions() {
@@ -2595,6 +2691,38 @@ $.fn.viewTransaction = function (index) {
          ${validator.unescape(settings.footer)}
          </p>
         </div>`;
+
+        receiptData = {
+          store: validator.unescape(settings.store),
+          addressOne: validator.unescape(settings.address_one),
+          addressTwo: validator.unescape(settings.address_two),
+          contact: validator.unescape(settings.contact),
+          taxNo: validator.unescape(settings.tax),
+          orderNumber,
+          refNumber,
+          customerName:
+            allTransactions[index].customer == 0
+              ? "Walk in Customer"
+              : allTransactions[index].customer.name,
+          cashier: allTransactions[index].user,
+          date: moment(allTransactions[index].date).format("DD MMM YYYY HH:mm:ss"),
+          items: products.map((item) => ({
+            name: item.product_name,
+            qty: item.quantity,
+            price: Math.abs(item.price),
+          })),
+          symbol: validator.unescape(settings.symbol),
+          subTotal: parseFloat(allTransactions[index].subtotal),
+          discount: parseFloat(discount) || 0,
+          chargeTax: !!settings.charge_tax,
+          taxPercentage: validator.unescape(settings.percentage),
+          totalVat: parseFloat(allTransactions[index].tax),
+          orderTotal: parseFloat(allTransactions[index].total),
+          paid: allTransactions[index].paid,
+          change: allTransactions[index].change,
+          paymentType: paymentMethod,
+          footer: validator.unescape(settings.footer),
+        };
 
         //prevent DOM XSS; allow windows paths in img src
         receipt = DOMPurify.sanitize(receipt,{ ALLOW_UNKNOWN_PROTOCOLS: true });
