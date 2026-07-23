@@ -8,3 +8,5 @@ LICENSE
 coverage
 *.old*
 *.log
+config.bat
+node_modules
