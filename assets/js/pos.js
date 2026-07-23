@@ -905,6 +905,7 @@ if (auth == undefined) {
         customerName: customer == 0 ? "Walk in customer" : customer.name,
         cashier: user.fullname,
         date,
+        logoPath: validator.unescape(settings.img) ? logo : "",
         items: cart.map((item) => ({
           name: item.product_name,
           qty: item.quantity,
@@ -2217,7 +2218,77 @@ function divider() {
   return "-".repeat(RECEIPT_COLUMNS);
 }
 
-function buildEscPosReceipt(data) {
+const RECEIPT_LOGO_MAX_WIDTH_PX = 300;
+
+async function loadLogoRaster(logoPath) {
+  try {
+    const src = getLogoSrc(logoPath);
+    if (!src) return null;
+
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Failed to load logo image"));
+      image.src = src;
+    });
+
+    const scale = Math.min(1, RECEIPT_LOGO_MAX_WIDTH_PX / img.width);
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const { data: pixels } = ctx.getImageData(0, 0, width, height);
+    const widthBytes = Math.ceil(width / 8);
+    const bitmap = Buffer.alloc(widthBytes * height);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        const alpha = pixels[i + 3];
+        const luminance =
+          alpha === 0 ? 255 : 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+        if (luminance < 200) {
+          bitmap[y * widthBytes + (x >> 3)] |= 0x80 >> x % 8;
+        }
+      }
+    }
+
+    return { widthBytes, height, bitmap };
+  } catch (e) {
+    console.error("Error rasterizing logo:", e);
+    return null;
+  }
+}
+
+function buildLogoEscPos(raster) {
+  if (!raster) return Buffer.alloc(0);
+  const { widthBytes, height, bitmap } = raster;
+  return Buffer.concat([
+    Buffer.from([ESC, 0x61, 0x01]),
+    Buffer.from([
+      GS,
+      0x76,
+      0x30,
+      0x00,
+      widthBytes & 0xff,
+      (widthBytes >> 8) & 0xff,
+      height & 0xff,
+      (height >> 8) & 0xff,
+    ]),
+    bitmap,
+    Buffer.from([ESC, 0x61, 0x00]),
+    Buffer.from("\n"),
+  ]);
+}
+
+async function buildEscPosReceipt(data) {
   const money = (n) => `${data.symbol}${moneyFormat(Number(n || 0).toFixed(2))}`;
   const lines = [];
 
@@ -2261,9 +2332,11 @@ function buildEscPosReceipt(data) {
   }
 
   const body = lines.join("\n") + "\n";
+  const logoRaster = data.logoPath ? await loadLogoRaster(data.logoPath) : null;
 
   return Buffer.concat([
     Buffer.from([ESC, 0x40]),
+    buildLogoEscPos(logoRaster),
     Buffer.from(body, "latin1"),
     Buffer.from([ESC, 0x64, 4]),
     Buffer.from([GS, 0x56, 0x42, 0x00]),
@@ -2293,7 +2366,7 @@ async function printReceipt(data) {
 
     storage.set("receipt_printer", printerName);
 
-    const buffer = buildEscPosReceipt(data);
+    const buffer = await buildEscPosReceipt(data);
     const tmpFile = path.join(os.tmpdir(), `pharmaspot-receipt-${Date.now()}.prn`);
     fs.writeFileSync(tmpFile, buffer);
 
@@ -2706,6 +2779,7 @@ $.fn.viewTransaction = function (index) {
               : allTransactions[index].customer.name,
           cashier: allTransactions[index].user,
           date: moment(allTransactions[index].date).format("DD MMM YYYY HH:mm:ss"),
+          logoPath: validator.unescape(settings.img) ? logo : "",
           items: products.map((item) => ({
             name: item.product_name,
             qty: item.quantity,
